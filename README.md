@@ -473,6 +473,21 @@ subscription credentials. In particular, OpenCode Go's unauthenticated local
 fallback currently assumes fixed 5h / 7d / 30d USD caps; those constants must
 be revalidated whenever the published Go quota model changes.
 
+## JSON quota collection
+
+For a quota dashboard that does not display pane activity or API spend, use:
+
+```sh
+usagebar collect --all --quotas-only
+```
+
+This retains subscription quota windows and run-out estimates, but skips pane
+activity, API spend, and cache diagnostics. With `--all`, it does not list
+Herdr panes or compute transcript activity for panes. If `HERDR_PANE_ID` is set,
+it may still query that pane to resolve the working directory. Without `--all`,
+it lists Herdr panes to select active subscription providers. Plain `collect`
+and the interactive panel retain the full activity data.
+
 ## Data handling
 
 Everything is computed from files that the agents already keep on your machine:
