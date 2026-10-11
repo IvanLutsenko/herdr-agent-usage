@@ -109,7 +109,7 @@ func TestWatchLoop_SkipsThenTicks(t *testing.T) {
 		},
 		acquire: func(time.Time) (*os.File, bool) { return nil, true },
 		release: func(*os.File) {},
-		touch:   func(time.Time) {},
+		touch:   func(*os.File, time.Time) {},
 	}.run()
 	if ticks != 1 || skips != 2 || sleeps != 1 {
 		t.Fatalf("ticks=%d skips=%d sleeps=%d", ticks, skips, sleeps)
@@ -141,6 +141,81 @@ func TestReleaseWatchLock_KeepsReclaimedLock(t *testing.T) {
 	}
 }
 
+// A displaced watcher's heartbeat must not make its replacement appear fresh.
+func TestTouchWatchLock_OnlyTouchesAcquiredInode(t *testing.T) {
+	isolateWatch(t)
+	now := time.UnixMilli(1_700_000_000_000)
+	old, ok := tryAcquireWatchLock(now)
+	if !ok {
+		t.Fatal("first acquire")
+	}
+	later := now.Add(watchLockStale + time.Second)
+	replacement, ok := tryAcquireWatchLock(later)
+	if !ok {
+		t.Fatal("stale lock must be reclaimed")
+	}
+	defer releaseWatchLock(replacement)
+	defer releaseWatchLock(old)
+
+	touchWatchLock(old, later.Add(time.Minute))
+	current, err := os.Stat(watchLockPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !current.ModTime().Equal(later) {
+		t.Fatalf("replacement mtime = %s, want %s", current.ModTime(), later)
+	}
+	held, err := old.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !held.ModTime().Equal(later.Add(time.Minute)) {
+		t.Fatalf("old inode mtime = %s", held.ModTime())
+	}
+}
+
+// The stale claimant starts after release checked ownership but before unlink.
+// It must acquire the lock only after release finishes, then retain it.
+func TestReleaseWatchLock_SerializesReclaimAfterOwnershipCheck(t *testing.T) {
+	isolateWatch(t)
+	now := time.UnixMilli(1_700_000_000_000)
+	old, ok := tryAcquireWatchLock(now)
+	if !ok {
+		t.Fatal("first acquire")
+	}
+	type acquired struct {
+		lock *os.File
+		ok   bool
+	}
+	started := make(chan struct{})
+	result := make(chan acquired, 1)
+	releaseWatchLockWithHook(old, func() {
+		go func() {
+			close(started)
+			lock, ok := tryAcquireWatchLock(now.Add(watchLockStale + time.Second))
+			result <- acquired{lock, ok}
+		}()
+		<-started
+		select {
+		case got := <-result:
+			if got.lock != nil {
+				_ = got.lock.Close()
+			}
+			t.Fatal("claimant acquired before release removed the old inode")
+		case <-time.After(20 * time.Millisecond):
+		}
+	})
+	select {
+	case got := <-result:
+		if !got.ok || !ownsWatchLock(got.lock) {
+			t.Fatal("new watcher did not retain the lock after release")
+		}
+		releaseWatchLock(got.lock)
+	case <-time.After(2 * time.Second):
+		t.Fatal("claimant could not acquire after release")
+	}
+}
+
 func TestWatchLoop_ExitsAfterLockIsReclaimed(t *testing.T) {
 	ticks := 0
 	owned := true
@@ -150,7 +225,7 @@ func TestWatchLoop_ExitsAfterLockIsReclaimed(t *testing.T) {
 		tick:    func() { ticks++ },
 		acquire: func(time.Time) (*os.File, bool) { return nil, true },
 		release: func(*os.File) {},
-		touch:   func(time.Time) {},
+		touch:   func(*os.File, time.Time) {},
 		owns:    func(*os.File) bool { return owned },
 	}.run()
 	if ticks != 1 {
@@ -178,7 +253,7 @@ func TestWatchLoop_BeatsOnlyAroundCollect(t *testing.T) {
 		},
 		acquire: func(time.Time) (*os.File, bool) { return nil, true },
 		release: func(*os.File) {},
-		touch:   func(time.Time) {},
+		touch:   func(*os.File, time.Time) {},
 		beat: func(*os.File) func() {
 			beats++
 			return func() { stops++ }
