@@ -52,7 +52,6 @@ func withWatchLockGuard(path string, action func()) bool {
 	if err := unix.Flock(int(guard.Fd()), unix.LOCK_EX); err != nil {
 		return false
 	}
-	defer unix.Flock(int(guard.Fd()), unix.LOCK_UN)
 	action()
 	return true
 }
