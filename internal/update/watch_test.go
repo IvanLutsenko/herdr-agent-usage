@@ -4,10 +4,13 @@
 package update
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func isolateWatch(t *testing.T) {
@@ -174,8 +177,8 @@ func TestTouchWatchLock_OnlyTouchesAcquiredInode(t *testing.T) {
 	}
 }
 
-// The stale claimant starts after release checked ownership but before unlink.
-// It must acquire the lock only after release finishes, then retain it.
+// A contender tries to take the guard after release checks ownership, before
+// unlink. It must be excluded until release finishes, then acquire a new lock.
 func TestReleaseWatchLock_SerializesReclaimAfterOwnershipCheck(t *testing.T) {
 	isolateWatch(t)
 	now := time.UnixMilli(1_700_000_000_000)
@@ -183,36 +186,25 @@ func TestReleaseWatchLock_SerializesReclaimAfterOwnershipCheck(t *testing.T) {
 	if !ok {
 		t.Fatal("first acquire")
 	}
-	type acquired struct {
-		lock *os.File
-		ok   bool
-	}
-	started := make(chan struct{})
-	result := make(chan acquired, 1)
 	releaseWatchLockWithHook(old, func() {
-		go func() {
-			close(started)
-			lock, ok := tryAcquireWatchLock(now.Add(watchLockStale + time.Second))
-			result <- acquired{lock, ok}
-		}()
-		<-started
-		select {
-		case got := <-result:
-			if got.lock != nil {
-				_ = got.lock.Close()
-			}
-			t.Fatal("claimant acquired before release removed the old inode")
-		case <-time.After(20 * time.Millisecond):
+		guard, err := os.OpenFile(watchLockPath()+".guard", os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer guard.Close()
+		// Nonblocking flock makes this interleaving observable without
+		// depending on goroutine scheduling or a timer.
+		if err := unix.Flock(int(guard.Fd()), unix.LOCK_EX|unix.LOCK_NB); !errors.Is(err, unix.EWOULDBLOCK) {
+			t.Fatalf("contender entered between ownership check and unlink: %v", err)
 		}
 	})
-	select {
-	case got := <-result:
-		if !got.ok || !ownsWatchLock(got.lock) {
-			t.Fatal("new watcher did not retain the lock after release")
-		}
-		releaseWatchLock(got.lock)
-	case <-time.After(2 * time.Second):
-		t.Fatal("claimant could not acquire after release")
+	replacement, ok := tryAcquireWatchLock(now.Add(watchLockStale + time.Second))
+	if !ok {
+		t.Fatal("contender could not acquire after release")
+	}
+	defer releaseWatchLock(replacement)
+	if !ownsWatchLock(replacement) {
+		t.Fatal("replacement lock was lost")
 	}
 }
 
