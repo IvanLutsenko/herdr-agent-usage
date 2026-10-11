@@ -5,8 +5,9 @@
  * A lock file keeps a single watcher. A second start exits immediately.
  * Ticks are skipped while the pane heartbeat is fresh so the 15s pane
  * collect remains the only clock when the pane is open. The lock mtime is
- * refreshed on every tick, including skipped ones, so a live watcher is
- * never treated as stale.
+ * refreshed on every tick, including skipped ones, and throughout a slow
+ * collect. A displaced watcher exits instead of running beside its replacement.
+ * A stable guard file serializes lock replacement and release.
  */
 package update
 
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/limits"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -39,39 +41,117 @@ func WatchAlreadyRunning(now time.Time) bool {
 	return now.Sub(st.ModTime()) <= watchLockStale
 }
 
-func tryAcquireWatchLock(now time.Time) (*os.File, bool) {
-	path := watchLockPath()
-	_ = os.MkdirAll(filepath.Dir(path), 0o755)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err == nil {
-		touchWatchLock(now)
-		return f, true
-	}
-	st, statErr := os.Stat(path)
-	if statErr != nil {
-		return nil, false
-	}
-	if now.Sub(st.ModTime()) <= watchLockStale {
-		return nil, false
-	}
-	_ = os.Remove(path)
-	f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+// The guard file is never removed: all watchers must lock the same inode
+// while checking or replacing the lock path.
+func withWatchLockGuard(path string, action func()) bool {
+	guard, err := os.OpenFile(path+".guard", os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, false
+		return false
 	}
-	touchWatchLock(now)
-	return f, true
+	defer guard.Close()
+	if err := unix.Flock(int(guard.Fd()), unix.LOCK_EX); err != nil {
+		return false
+	}
+	action()
+	return true
 }
 
-func touchWatchLock(now time.Time) {
-	_ = os.Chtimes(watchLockPath(), now, now)
+func tryAcquireWatchLock(now time.Time) (*os.File, bool) {
+	path := watchLockPath()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, false
+	}
+	var lock *os.File
+	if !withWatchLockGuard(path, func() {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err != nil {
+			st, statErr := os.Stat(path)
+			if statErr != nil || now.Sub(st.ModTime()) <= watchLockStale {
+				return
+			}
+			if err := os.Remove(path); err != nil {
+				return
+			}
+			f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+			if err != nil {
+				return
+			}
+		}
+		touchWatchLock(f, now)
+		lock = f
+	}) {
+		return nil, false
+	}
+	return lock, lock != nil
+}
+
+// Futimes updates only the acquired inode, even if its path was reclaimed.
+func touchWatchLock(f *os.File, now time.Time) {
+	if f == nil {
+		return
+	}
+	tv := unix.NsecToTimeval(now.UnixNano())
+	_ = unix.Futimes(int(f.Fd()), []unix.Timeval{tv, tv})
+}
+
+// ownsWatchLock is true while the lock path still names the file this
+// watcher created; a reclaim replaces it with a different file.
+func ownsWatchLock(f *os.File) bool {
+	if f == nil {
+		return false
+	}
+	held, err := f.Stat()
+	if err != nil {
+		return false
+	}
+	current, err := os.Stat(watchLockPath())
+	return err == nil && os.SameFile(held, current)
 }
 
 func releaseWatchLock(f *os.File) {
-	if f != nil {
-		_ = f.Close()
+	releaseWatchLockWithHook(f, nil)
+}
+
+// The hook lets tests pause between the ownership check and removal.
+func releaseWatchLockWithHook(f *os.File, beforeRemove func()) {
+	if f == nil {
+		return
 	}
-	_ = os.Remove(watchLockPath())
+	path := watchLockPath()
+	withWatchLockGuard(path, func() {
+		if ownsWatchLock(f) {
+			if beforeRemove != nil {
+				beforeRemove()
+			}
+			_ = os.Remove(path)
+		}
+	})
+	_ = f.Close()
+}
+
+// beatWatchLock keeps the lock fresh while a collect outlasts watchLockStale.
+func beatWatchLock(f *os.File) func() {
+	ticker := time.NewTicker(watchLockStale / 4)
+	done := make(chan struct{})
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		for {
+			select {
+			case <-done:
+				return
+			case now := <-ticker.C:
+				if ownsWatchLock(f) {
+					touchWatchLock(f, now)
+				}
+			}
+		}
+	}()
+	return func() {
+		ticker.Stop()
+		close(done)
+		<-exited
+	}
 }
 
 func collectWatchProviders(cwd *string, nowMs int64) []limits.ProviderLimits {
@@ -95,7 +175,9 @@ type watchLoop struct {
 	tick    func()
 	acquire func(time.Time) (*os.File, bool)
 	release func(*os.File)
-	touch   func(time.Time)
+	touch   func(*os.File, time.Time)
+	owns    func(*os.File) bool
+	beat    func(*os.File) func()
 }
 
 func (w watchLoop) run() {
@@ -109,17 +191,27 @@ func (w watchLoop) run() {
 	if w.release != nil {
 		defer w.release(lock)
 	}
-	runTick := func() {
+	// runTick reports false once another watcher has reclaimed the lock.
+	runTick := func() bool {
+		if w.owns != nil && !w.owns(lock) {
+			return false
+		}
 		now := w.now()
 		if w.touch != nil {
-			w.touch(now)
+			w.touch(lock, now)
 		}
 		if w.skip != nil && w.skip(now) {
-			return
+			return true
+		}
+		if w.beat != nil {
+			defer w.beat(lock)()
 		}
 		w.tick()
+		return true
 	}
-	runTick()
+	if !runTick() {
+		return
+	}
 	for {
 		if stopped(w.stop) {
 			return
@@ -128,7 +220,9 @@ func (w watchLoop) run() {
 		if stopped(w.stop) {
 			return
 		}
-		runTick()
+		if !runTick() {
+			return
+		}
 	}
 }
 
@@ -161,6 +255,8 @@ func RunWatch(cwd *string, now func() time.Time, sleep func(time.Duration), stop
 		acquire: tryAcquireWatchLock,
 		release: releaseWatchLock,
 		touch:   touchWatchLock,
+		owns:    ownsWatchLock,
+		beat:    beatWatchLock,
 		tick: func() {
 			tickNow := now()
 			nowMs := tickNow.UnixMilli()
