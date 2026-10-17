@@ -47,7 +47,23 @@ herdr plugin action invoke usagebar.enable-toast
 herdr server reload-config
 ```
 
-`herdr plugin install` provisions the `usagebar` binary automatically as part of install/update (via the manifest's `[[build]]` hook): it builds with the local Go toolchain (≥ 1.25) when available, and otherwise downloads a prebuilt binary from [GitHub Releases](https://github.com/senna-lang/herdr-agent-usage/releases) (macOS / Linux, arm64 / amd64). `usagebar.setup` repeats this resolution as a fallback for installs predating the build hook. To build manually instead, run `make build` in the plugin root.
+`herdr plugin install` provisions the `usagebar` binary via the manifest's `[[build]]` hook: it builds with the local Go toolchain (≥ 1.25) when available, and otherwise downloads a prebuilt binary from [GitHub Releases](https://github.com/senna-lang/herdr-agent-usage/releases) (macOS / Linux, arm64 / amd64). `usagebar.setup` repeats this resolution as a fallback for installs predating the build hook. To build manually instead, run `make build` in the plugin root.
+
+## Update
+
+On Herdr 0.9.4+:
+
+```bash
+herdr plugin update usagebar --yes
+```
+
+That refetches the GitHub-managed checkout and runs `[[build]]` again. Running plugin panes keep their original files; new invocations pick up the update without a config reload. Startup hooks run at the next server start. Locally linked plugins are left alone — rebuild those with `make build`.
+
+On Herdr older than 0.9.4 there is no separate update command:
+
+```bash
+herdr plugin install senna-lang/herdr-agent-usage --yes
+```
 
 ## Let an LLM set it up
 
