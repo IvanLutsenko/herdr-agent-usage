@@ -177,7 +177,10 @@ and has no separator setting, so the harness and billing identity are not
 shown side by side. This makes the standard display `title`,
 `provider · limit`, then context. Run `herdr server reload-config` after
 editing. The limit disappears automatically when the matching provider has no
-limit data.
+limit data. `$context` is shortened to fit the sidebar. Where Herdr reports the
+live sidebar width (0.8.x) that width is used, so a drag-resized sidebar is
+followed; on Herdr 0.9+ it is not reported, so `[ui] sidebar_width` from your
+Herdr config (default 26 columns) is used instead.
 
 ### Plugin config
 
@@ -603,7 +606,7 @@ No telemetry, no analytics, or usage/session data is sent. State written by the 
 
 - **Not a billing dashboard.** Local transcripts / rollouts / signals (and optional OpenCode web / Grok.com credits) can differ from official consoles (other machines, server-side windows).
 - **Herdr core config is not rewritten on install.** Use `usagebar.setup` / `usagebar.enable-toast` or edit by hand.
-- **macOS / Linux** only.
+- **macOS / Linux** only. On Herdr 0.9+, `$context` length follows the configured `ui.sidebar_width`, not a drag-resized or per-client sidebar.
 
 ## Contributing
 
