@@ -367,9 +367,10 @@ func TestCollectAllProviderLimitsExpiresElapsedWindows(t *testing.T) {
 	opts := CollectOptions{
 		Codex: []CodexProfileCollector{{ID: "codex", Label: "Codex", Collector: func(_ *string, _ int64) ProviderLimits {
 			return ProviderLimits{
-				ProviderID: "codex",
-				Primary:    &LimitWindow{UsedPercentage: 96, ResetsAt: &past, WindowMinutes: &win},
-				Secondary:  &LimitWindow{UsedPercentage: 18, ResetsAt: &future},
+				ProviderID:  "codex",
+				Primary:     &LimitWindow{UsedPercentage: 96, ResetsAt: &past, WindowMinutes: &win},
+				Secondary:   &LimitWindow{UsedPercentage: 18, ResetsAt: &future},
+				FetchedAtMs: nowMs - 5*60*60_000,
 			}
 		}}},
 		Only: map[string]bool{"codex": true},
@@ -384,5 +385,27 @@ func TestCollectAllProviderLimitsExpiresElapsedWindows(t *testing.T) {
 	}
 	if s := got[0].Secondary; s.UsedPercentage != 18 || s.ResetsAt == nil {
 		t.Errorf("live secondary changed: %+v", *s)
+	}
+}
+
+// A rolling estimate computed now must keep its usage even when the oldest
+// event is about to leave the window and resetsAt rounds down to now.
+func TestCollectAllProviderLimitsKeepsFreshRollingWindow(t *testing.T) {
+	nowMs := int64(1_000_000_000_500)
+	for _, untilOldestExpiresMs := range []int64{0, 500, 1500} {
+		events := []CostEvent{
+			{CreatedMs: nowMs - fiveHourMs + untilOldestExpiresMs, CostUSD: 6},
+			{CreatedMs: nowMs - 60_000, CostUSD: 3},
+		}
+		opts := CollectOptions{
+			OpenCode: []OpenCodeProfileCollector{{ID: "opencode", Label: "OpenCode", Collector: func(_ *string, now int64) ProviderLimits {
+				return ProviderLimitsFromGoCostEvents(events, now)
+			}}},
+			Only: map[string]bool{"opencode": true},
+		}
+		got := CollectAllProviderLimits(nil, nowMs, opts)
+		if p := got[0].Primary; p.UsedPercentage != 75 || p.ResetsAt == nil {
+			t.Errorf("%dms until oldest expires: primary = %+v, want 75%% with resetsAt", untilOldestExpiresMs, *p)
+		}
 	}
 }

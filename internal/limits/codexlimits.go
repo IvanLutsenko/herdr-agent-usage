@@ -234,6 +234,10 @@ func CollectCodexLimitsIn(home, providerID, label string, nowMs int64) ProviderL
 			continue
 		}
 		observedMs := rolloutObservedAtMs(path)
+		fetchedMs := observedMs
+		if fetchedMs <= 0 {
+			fetchedMs = nowMs
+		}
 		out := ProviderLimits{
 			ProviderID:  providerID,
 			Label:       label,
@@ -241,7 +245,7 @@ func CollectCodexLimitsIn(home, providerID, label string, nowMs int64) ProviderL
 			Secondary:   extracted.Secondary,
 			PlanType:    planlabels.CodexPlanLabel(extracted.PlanType),
 			Source:      "codex rollout",
-			FetchedAtMs: nowMs,
+			FetchedAtMs: fetchedMs,
 		}
 		if age := minutesBetween(observedMs, nowMs); age > codexStaleAfterMinutes {
 			note := "stale ~" + itoa(age) + "m ago"
