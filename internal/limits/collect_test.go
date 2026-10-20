@@ -358,3 +358,31 @@ func TestCollectAllProviderLimits_MultipleGrokAndOpenCodeProfiles(t *testing.T) 
 		}
 	}
 }
+
+func TestCollectAllProviderLimitsExpiresElapsedWindows(t *testing.T) {
+	nowMs := int64(1_000_000_000_000)
+	past := nowMs/1000 - 60
+	future := nowMs/1000 + 3600
+	win := 300
+	opts := CollectOptions{
+		Codex: []CodexProfileCollector{{ID: "codex", Label: "Codex", Collector: func(_ *string, _ int64) ProviderLimits {
+			return ProviderLimits{
+				ProviderID: "codex",
+				Primary:    &LimitWindow{UsedPercentage: 96, ResetsAt: &past, WindowMinutes: &win},
+				Secondary:  &LimitWindow{UsedPercentage: 18, ResetsAt: &future},
+			}
+		}}},
+		Only: map[string]bool{"codex": true},
+	}
+	got := CollectAllProviderLimits(nil, nowMs, opts)
+	if len(got) != 1 {
+		t.Fatalf("want 1 provider, got %d", len(got))
+	}
+	p := got[0].Primary
+	if p.UsedPercentage != 0 || p.ResetsAt != nil || p.WindowMinutes == nil || *p.WindowMinutes != win {
+		t.Errorf("elapsed primary not reset: %+v", *p)
+	}
+	if s := got[0].Secondary; s.UsedPercentage != 18 || s.ResetsAt == nil {
+		t.Errorf("live secondary changed: %+v", *s)
+	}
+}
