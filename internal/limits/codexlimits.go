@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/senna-lang/herdr-agent-usage/internal/fsutil"
 	"github.com/senna-lang/herdr-agent-usage/internal/planlabels"
@@ -34,6 +35,9 @@ type ExtractedCodexRateLimits struct {
 	Primary   *LimitWindow
 	Secondary *LimitWindow
 	PlanType  *string
+	// ObservedAtMs is the token_count line's own timestamp, i.e. when Codex
+	// recorded this snapshot. 0 when the line carries no parsable timestamp.
+	ObservedAtMs int64
 }
 
 // ExtractRateLimitsFromLines extracts the most recent rate_limits from lines.
@@ -44,8 +48,9 @@ func ExtractRateLimitsFromLines(lines []string) *ExtractedCodexRateLimits {
 			continue
 		}
 		var parsed struct {
-			Type    string `json:"type"`
-			Payload *struct {
+			Timestamp string `json:"timestamp"`
+			Type      string `json:"type"`
+			Payload   *struct {
 				Type       string `json:"type"`
 				RateLimits *struct {
 					Primary   *rateWindowRaw `json:"primary"`
@@ -81,6 +86,7 @@ func ExtractRateLimitsFromLines(lines []string) *ExtractedCodexRateLimits {
 		}
 		return &ExtractedCodexRateLimits{
 			Primary: primary, Secondary: secondary, PlanType: rate.PlanType,
+			ObservedAtMs: parseLineTimestampMs(parsed.Timestamp),
 		}
 	}
 	return nil
@@ -233,9 +239,15 @@ func CollectCodexLimitsIn(home, providerID, label string, nowMs int64) ProviderL
 		if extracted == nil {
 			continue
 		}
-		observedMs := rolloutObservedAtMs(path)
+		// Freshness comes from the snapshot line, not the file: Codex appends
+		// task_started and friends without a new token_count, so the rollout
+		// mtime can postdate a reset the snapshot never saw.
+		observedMs := extracted.ObservedAtMs
 		fetchedMs := observedMs
-		if fetchedMs <= 0 {
+		if observedMs <= 0 {
+			// No line timestamp: mtime still bounds staleness, but is too loose
+			// to prove the snapshot postdates a reset, so expiry stays off.
+			observedMs = rolloutObservedAtMs(path)
 			fetchedMs = nowMs
 		}
 		out := ProviderLimits{
@@ -280,8 +292,18 @@ func borrowCodexWindowsIn(home, providerID, label string, nowMs int64) *Provider
 	return borrowed
 }
 
-// rolloutObservedAtMs is when the rollout last recorded a turn, i.e. when its
-// rate-limit snapshot was taken. 0 when the file cannot be stat'd.
+// parseLineTimestampMs parses a rollout line's RFC 3339 timestamp; 0 when absent
+// or malformed.
+func parseLineTimestampMs(ts string) int64 {
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return 0
+	}
+	return t.UnixMilli()
+}
+
+// rolloutObservedAtMs is when the rollout was last written — any line, not
+// necessarily a token_count. 0 when the file cannot be stat'd.
 func rolloutObservedAtMs(path string) int64 {
 	info, err := os.Stat(path)
 	if err != nil {

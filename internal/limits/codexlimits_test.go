@@ -89,6 +89,15 @@ func sessionMetaLine(cwd string) string {
 	return string(b)
 }
 
+// stampLine sets a rollout line's top-level timestamp, as Codex writes it.
+func stampLine(line string, at time.Time) string {
+	var m map[string]any
+	_ = json.Unmarshal([]byte(line), &m)
+	m["timestamp"] = at.UTC().Format("2006-01-02T15:04:05.000Z")
+	b, _ := json.Marshal(m)
+	return string(b)
+}
+
 // writeRollout writes a rollout jsonl under CODEX_HOME/sessions and stamps its
 // mtime (ListNewestRolloutPaths orders by mtime). When usedPercent < 0, the file
 // holds only session_meta (a just-opened session with no token_count yet).
@@ -100,10 +109,10 @@ func writeRollout(t *testing.T, root, name, cwd string, usedPercent float64, mti
 	}
 	content := sessionMetaLine(cwd) + "\n"
 	if usedPercent >= 0 {
-		content += tokenCountRateLine(
+		content += stampLine(tokenCountRateLine(
 			map[string]any{"used_percent": usedPercent, "window_minutes": 10080, "resets_at": 1784816502},
 			nil, "plus",
-		) + "\n"
+		), mtime) + "\n"
 	}
 	path := filepath.Join(dir, "rollout-2026-07-18T00-00-00-"+name+".jsonl")
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
@@ -375,5 +384,85 @@ func TestCollectCodexLimits_FreshestObservationWins(t *testing.T) {
 				t.Fatalf("primary used = %v%%, want %v%%", got.Primary.UsedPercentage, tc.wantPrimaryPct)
 			}
 		})
+	}
+}
+
+// The snapshot's own timestamp, not the rollout mtime, decides whether it
+// predates a reset. Codex appends task_started and similar lines without a new
+// token_count, so a resumed session's mtime says nothing about the usage.
+// Runs the real collector through CollectAllProviderLimits and EnrichRunOut:
+// a pre-reset 96% restored as fresh would feed run-out history and later
+// project a bogus "empty soon" against the next real 2% reading.
+func TestCollectCodexLimits_ExpiryFollowsSnapshotNotRolloutWrites(t *testing.T) {
+	useAgentDB(t)
+	root := t.TempDir()
+	dir := filepath.Join(root, "sessions", "2026", "07", "18")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "rollout-2026-07-18T00-00-00-a.jsonl")
+
+	resetAt := time.Unix(1_784_000_000, 0)
+	snapshotAt := resetAt.Add(-10 * time.Minute)
+	content := sessionMetaLine("/repo") + "\n" + stampLine(tokenCountRateLine(
+		map[string]any{"used_percent": 96, "window_minutes": 300, "resets_at": resetAt.Unix()},
+		nil, "plus",
+	), snapshotAt) + "\n"
+	write := func(at time.Time) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opts := CollectOptions{
+		Codex: []CodexProfileCollector{{ID: "codex", Label: "Codex", Collector: func(_ *string, now int64) ProviderLimits {
+			return CollectCodexLimitsIn(root, "codex", "Codex", now)
+		}}},
+		Only: map[string]bool{"codex": true},
+	}
+	var history UsageHistory
+	poll := func(at time.Time) *LimitWindow {
+		t.Helper()
+		got := EnrichRunOut(CollectAllProviderLimits(nil, at.UnixMilli(), opts), history, at.UnixMilli(), DefaultRunOutOptions)
+		history = got.History
+		if len(got.Providers) != 1 || got.Providers[0].Primary == nil {
+			t.Fatalf("providers = %+v", got.Providers)
+		}
+		return got.Providers[0].Primary
+	}
+
+	// Idle past the reset: nothing new is written.
+	write(snapshotAt)
+	for _, at := range []time.Time{resetAt.Add(time.Minute), resetAt.Add(5 * time.Minute)} {
+		if p := poll(at); p.UsedPercentage != 0 {
+			t.Fatalf("idle at %v: primary = %v%%, want 0 (window reset)", at.Sub(resetAt), p.UsedPercentage)
+		}
+	}
+
+	// The session resumes: task_started lands, but no token_count yet.
+	resumedAt := resetAt.Add(10 * time.Minute)
+	b, _ := json.Marshal(map[string]any{"type": "event_msg", "payload": map[string]any{"type": "task_started"}})
+	content += stampLine(string(b), resumedAt) + "\n"
+	write(resumedAt)
+	if p := poll(resumedAt); p.UsedPercentage != 0 {
+		t.Fatalf("after task_started: primary = %v%%, want 0 (the pre-reset snapshot must not revive)", p.UsedPercentage)
+	}
+
+	// The first post-reset token_count arrives.
+	freshAt := resumedAt.Add(time.Minute)
+	content += stampLine(tokenCountRateLine(
+		map[string]any{"used_percent": 2, "window_minutes": 300, "resets_at": freshAt.Add(300 * time.Minute).Unix()},
+		nil, "plus",
+	), freshAt) + "\n"
+	write(freshAt)
+	p := poll(freshAt)
+	if p.UsedPercentage != 2 {
+		t.Fatalf("fresh snapshot: primary = %v%%, want 2", p.UsedPercentage)
+	}
+	if p.RunOut != nil {
+		t.Fatalf("fresh 2%% snapshot carries run-out warning %+v (history polluted by the stale 96%%)", *p.RunOut)
 	}
 }
