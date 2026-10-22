@@ -28,6 +28,10 @@ registration in `internal/providers`, provider-specific session extraction and
 resolution in `internal/providers/<agent>`, limit collection and presentation
 in `internal/limits`, and plugin setup in `internal/setup`.
 
+Use a supported Go release with its latest security patches. CI and release
+workflows pin the compiler patch explicitly; update their pins together when
+addressing standard-library vulnerability reports.
+
 Build and test the project from the repository root:
 
 ```sh
